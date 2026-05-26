@@ -1,4 +1,5 @@
 """Lambda: Forward CloudWatch Alarm alerts to DingTalk and trigger DevOps Agent investigation."""
+import base64
 import hashlib
 import hmac
 import json
@@ -119,13 +120,16 @@ def _trigger_investigation(title, description):
         "timestamp": timestamp,
     })
 
-    signature = hmac.new(
-        webhook_secret.encode(), payload.encode(), hashlib.sha256,
-    ).hexdigest()
+    # HMAC-SHA256(timestamp:payload, secret) base64 encoded — matches Agent Space spec
+    signed_content = f"{timestamp}:{payload}".encode()
+    signature = base64.b64encode(
+        hmac.new(webhook_secret.encode(), signed_content, hashlib.sha256).digest()
+    ).decode()
 
     req = Request(webhook_url, data=payload.encode(), headers={
         "Content-Type": "application/json",
-        "X-Signature": signature,
+        "x-amzn-event-timestamp": timestamp,
+        "x-amzn-event-signature": signature,
     })
 
     try:
