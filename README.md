@@ -13,19 +13,193 @@ CloudWatch 告警自动触发 AWS DevOps Agent 调查，调查结果推送到钉
 
 ## 架构
 
-```
-告警通知链路:
-CloudWatch Alarm (ALARM/OK) → SNS → Lambda(dingtalk-notifier) → 钉钉群
-                                                ↓
-                                    Agent Space Webhook → 自动调查
-                                                ↓
-                              EventBridge → Lambda(investigation-notifier) → 钉钉群
+### 整体架构图
 
-双向对话链路:
-钉钉群 @Bot → DingTalk Stream (wss) → ECS Fargate Bot
-                                          │
-                                          ├─ DevOps Agent CreateChat/SendMessage
-                                          └─ 回复 → DingTalk OpenAPI → 钉钉群
+```mermaid
+graph TB
+    subgraph DingTalk["📱 钉钉"]
+        DTUser[用户/群聊]
+        DTApp[钉钉应用<br/>Stream 模式]
+    end
+
+    subgraph AWS["☁️ AWS Account"]
+        subgraph VPC["VPC（CDK 新建或复用）"]
+            subgraph Private["私有子网"]
+                Bot["🤖 ECS Fargate<br/>dingtalk-bot<br/>(单实例)"]
+            end
+            NAT["🌐 NAT Gateway"]
+        end
+
+        subgraph Lambda["⚡ Lambda"]
+            L1["dingtalk-notifier<br/>(SNS 触发)"]
+            L2["investigation-notifier<br/>(EventBridge 触发)"]
+        end
+
+        subgraph Storage["🔐 凭证 & 队列"]
+            SM1["Secrets Manager<br/>dingtalk-bot"]
+            SM2["Secrets Manager<br/>webhook"]
+            DLQ["SQS DLQ<br/>(14 天保留)"]
+        end
+
+        subgraph Events["📬 事件路由"]
+            CW["CloudWatch Alarm"]
+            SNS["SNS Topic"]
+            EB["EventBridge<br/>aws.aidevops"]
+        end
+
+        subgraph Agent["🧠 AWS DevOps Agent"]
+            AS["Agent Space"]
+            WH["Webhook"]
+        end
+    end
+
+    %% 告警通知链路
+    CW -->|ALARM/OK| SNS
+    SNS -->|invoke| L1
+    L1 -->|HMAC POST| WH
+    WH -->|create investigation| AS
+    L1 -->|markdown 卡片| DTApp
+
+    %% 调查结果链路
+    AS -->|Investigation events| EB
+    EB -->|invoke| L2
+    L2 -->|ListJournalRecords| AS
+    L2 -->|根因摘要| DTApp
+
+    %% 双向对话链路
+    DTUser -->|@Bot 提问| DTApp
+    DTApp -->|Stream wss<br/>CALLBACK| Bot
+    Bot -->|CreateChat<br/>SendMessage| AS
+    Bot -->|OpenAPI 回复| DTApp
+    DTApp -->|markdown| DTUser
+
+    %% 凭证读取
+    L1 -.读取.-> SM1
+    L1 -.读取.-> SM2
+    L2 -.读取.-> SM1
+    Bot -.注入.-> SM1
+
+    %% 失败兜底
+    L1 -.失败.-> DLQ
+    L2 -.失败.-> DLQ
+
+    %% 出网
+    Bot -->|出站流量| NAT
+    NAT -->|api.dingtalk.com| DTApp
+
+    classDef aws fill:#FF9900,stroke:#232F3E,color:#fff
+    classDef dingtalk fill:#3296FA,stroke:#1A5DAB,color:#fff
+    classDef storage fill:#7AA116,stroke:#3F6611,color:#fff
+    class Bot,L1,L2,SNS,EB,CW,AS,WH,NAT aws
+    class DTUser,DTApp dingtalk
+    class SM1,SM2,DLQ storage
+```
+
+### 数据流详解
+
+#### 链路 1：CloudWatch 告警 → 钉钉通知 + 自动调查
+
+```
+┌─────────────────┐    ┌──────────┐    ┌────────────────────┐    ┌──────────┐
+│ CloudWatch      │───▶│ SNS      │───▶│ Lambda             │───▶│ 钉钉群   │
+│ Alarm (ALARM)   │    │ Topic    │    │ dingtalk-notifier  │    │ 红色卡片 │
+└─────────────────┘    └──────────┘    └─────────┬──────────┘    └──────────┘
+                                                 │
+                                                 │ HMAC-SHA256 签名
+                                                 ▼
+                                       ┌────────────────────┐
+                                       │ Agent Space        │
+                                       │ Webhook            │
+                                       └─────────┬──────────┘
+                                                 │
+                                                 │ 创建 Investigation
+                                                 ▼
+                                       ┌────────────────────┐
+                                       │ DevOps Agent       │
+                                       │ 自动调查           │
+                                       └────────────────────┘
+```
+
+#### 链路 2：DevOps Agent 调查结果 → 钉钉
+
+```
+┌──────────────────┐    ┌──────────────┐    ┌────────────────────────┐    ┌──────────┐
+│ DevOps Agent     │───▶│ EventBridge  │───▶│ Lambda                 │───▶│ 钉钉群   │
+│ Investigation    │    │ aws.aidevops │    │ investigation-notifier │    │ 调查结果 │
+│ Created/Done/... │    └──────────────┘    └────────────┬───────────┘    └──────────┘
+└──────────────────┘                                     │
+                                                         │ ListJournalRecords
+                                                         ▼
+                                                ┌────────────────┐
+                                                │ 提取根因摘要   │
+                                                │ 格式化 markdown│
+                                                └────────────────┘
+```
+
+#### 链路 3：钉钉 @Bot → DevOps Agent 双向对话
+
+```
+┌──────────┐                                                        ┌────────────────┐
+│ 用户     │                                                        │ DevOps Agent   │
+│ @Bot 提问│                                                        │ Agent Space    │
+└────┬─────┘                                                        └────────┬───────┘
+     │                                                                       ▲
+     ▼                                                                       │
+┌────────────┐  Stream wss   ┌──────────────────┐  CreateChat/SendMessage   │
+│ 钉钉 App   │◀─────────────▶│ ECS Fargate Bot  │───────────────────────────┘
+│ Stream 网关│   CALLBACK     │ (单实例)         │
+└────────────┘                │                  │
+     ▲                        │ 1. 即时 ACK      │
+     │                        │ 2. 调用 Agent    │
+     │   OpenAPI 回复          │ 3. EventStream  │
+     └────────────────────────│    解析 + 拆分   │
+        markdown              │ 4. 多群广播      │
+                              └──────────────────┘
+                                       │
+                                       │ 通过 NAT Gateway 出网
+                                       ▼
+                              ┌──────────────────┐
+                              │ api.dingtalk.com │
+                              └──────────────────┘
+```
+
+### 部署拓扑
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      AWS Account / Region                         │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                      VPC (CDK 创建/复用)                    │ │
+│  │                                                              │ │
+│  │  ┌─────────────────┐         ┌─────────────────┐           │ │
+│  │  │  Public Subnet  │         │ Public Subnet   │           │ │
+│  │  │  ┌─────────┐    │         │  ┌─────────┐    │           │ │
+│  │  │  │  IGW    │    │         │  │  NAT    │    │           │ │
+│  │  │  └─────────┘    │         │  │ Gateway │    │           │ │
+│  │  │                 │         │  └─────────┘    │           │ │
+│  │  └─────────────────┘         └─────────────────┘           │ │
+│  │           │                          │                       │ │
+│  │  ┌────────┴─────────┐        ┌──────┴──────────┐           │ │
+│  │  │ Private Subnet   │        │ Private Subnet  │           │ │
+│  │  │                  │        │                 │           │ │
+│  │  │  ┌────────────┐  │        │                 │           │ │
+│  │  │  │ ECS Task   │  │        │                 │           │ │
+│  │  │  │ Bot (1 个) │  │        │                 │           │ │
+│  │  │  └────────────┘  │        │                 │           │ │
+│  │  │       AZ-1       │        │      AZ-2       │           │ │
+│  │  └──────────────────┘        └─────────────────┘           │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────────────┐ │
+│  │  SNS     │  │EventBridge│  │ Lambda   │  │ Secrets Manager │ │
+│  │  Topic   │  │   Rule    │  │ x 2      │  │   x 2           │ │
+│  └──────────┘  └──────────┘  └──────────┘  └─────────────────┘ │
+│                                                                   │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────────┐             │
+│  │  SQS DLQ │  │CloudWatch Logs│  │ ECR Repository │             │
+│  └──────────┘  └──────────────┘  └────────────────┘             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## 组件
