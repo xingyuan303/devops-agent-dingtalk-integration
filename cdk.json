@@ -3,6 +3,8 @@
   "context": {
     "agent_space_id": "",
     "dingtalk_chat_id": "",
-    "use_codebuild": false
+    "resource_prefix": "devops-agent",
+    "vpc_id": "",
+    "destroy_secrets": false
   }
 }

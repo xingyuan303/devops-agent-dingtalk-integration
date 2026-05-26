@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 import boto3
+from dingtalk_utils import send_dingtalk_markdown
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -19,10 +20,7 @@ WEBHOOK_SECRET_NAME = os.environ.get("WEBHOOK_SECRET_NAME", "")
 DINGTALK_CHAT_ID = os.environ.get("DINGTALK_CHAT_ID", "")
 
 _secrets_client = None
-_dingtalk_creds = None
 _webhook_creds = None
-_access_token = ""
-_token_expires = 0
 
 
 def _secrets():
@@ -32,46 +30,12 @@ def _secrets():
     return _secrets_client
 
 
-def _get_dingtalk_creds():
-    global _dingtalk_creds
-    if _dingtalk_creds is None and DINGTALK_SECRET_NAME:
-        resp = _secrets().get_secret_value(SecretId=DINGTALK_SECRET_NAME)
-        _dingtalk_creds = json.loads(resp["SecretString"])
-    return _dingtalk_creds or {}
-
-
 def _get_webhook_creds():
     global _webhook_creds
     if _webhook_creds is None and WEBHOOK_SECRET_NAME:
         resp = _secrets().get_secret_value(SecretId=WEBHOOK_SECRET_NAME)
         _webhook_creds = json.loads(resp["SecretString"])
     return _webhook_creds or {}
-
-
-def _get_access_token():
-    global _access_token, _token_expires
-    if _access_token and time.time() < _token_expires:
-        return _access_token
-    creds = _get_dingtalk_creds()
-    if not creds:
-        return ""
-    payload = json.dumps({
-        "appKey": creds["DINGTALK_APP_KEY"],
-        "appSecret": creds["DINGTALK_APP_SECRET"],
-    }).encode()
-    req = Request(
-        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-        data=payload, headers={"Content-Type": "application/json"}, method="POST",
-    )
-    try:
-        with urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            _access_token = result.get("accessToken", "")
-            _token_expires = time.time() + result.get("expireIn", 7200) - 300
-            return _access_token
-    except URLError as e:
-        logger.error("Failed to get access_token: %s", e)
-        return ""
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -99,7 +63,6 @@ def _handle_cloudwatch_alarm(body):
     namespace = body.get("Trigger", {}).get("Namespace", "")
     metric = body.get("Trigger", {}).get("MetricName", "")
 
-    status = "🔴 ALARM" if new_state == "ALARM" else "🟢 OK"
     summary = f"{namespace}/{metric}: {reason[:200]}" if metric else reason[:300]
 
     alarm_arn = body.get("AlarmArn", "")
@@ -110,17 +73,25 @@ def _handle_cloudwatch_alarm(body):
         f"?region={alarm_region}#alarmsV2:alarm/{alarm_name}"
     )
 
-    markdown = (
-        f"### {status} {alarm_name}\n\n"
-        f"- **时间**: {timestamp}\n"
-        f"- **来源**: CloudWatch ({namespace})\n"
-        f"- **摘要**: {summary}\n\n"
-        f"[查看监控]({source_url})"
-    )
-    _send_dingtalk_markdown(f"[ALARM] {alarm_name}", markdown)
-
     if new_state == "ALARM":
+        markdown = (
+            f"### 🔴 ALARM {alarm_name}\n\n"
+            f"- **时间**: {timestamp}\n"
+            f"- **来源**: CloudWatch ({namespace})\n"
+            f"- **摘要**: {summary}\n\n"
+            f"[查看监控]({source_url})"
+        )
+        send_dingtalk_markdown(DINGTALK_SECRET_NAME, DINGTALK_CHAT_ID, f"[ALARM] {alarm_name}", markdown)
         _trigger_investigation(alarm_name, summary)
+    elif new_state == "OK":
+        markdown = (
+            f"### 🟢 恢复 {alarm_name}\n\n"
+            f"- **时间**: {timestamp}\n"
+            f"- **来源**: CloudWatch ({namespace})\n"
+            f"- **摘要**: {summary}\n\n"
+            f"[查看监控]({source_url})"
+        )
+        send_dingtalk_markdown(DINGTALK_SECRET_NAME, DINGTALK_CHAT_ID, f"[OK] {alarm_name}", markdown)
 
     return {"statusCode": 200, "body": json.dumps({"message": f"Processed: {alarm_name}"})}
 
@@ -162,39 +133,3 @@ def _trigger_investigation(title, description):
             logger.info("Investigation triggered: %s (status %d)", incident_id, resp.status)
     except URLError as exc:
         logger.error("Failed to trigger investigation: %s", exc)
-
-
-# ── DingTalk OpenAPI Sending ───────────────────────────────────────────────────
-def _send_dingtalk_markdown(title: str, text: str):
-    """Send markdown via DingTalk OpenAPI (robot groupMessages)."""
-    chat_id = DINGTALK_CHAT_ID
-    if not chat_id:
-        logger.warning("DINGTALK_CHAT_ID not configured")
-        return
-
-    token = _get_access_token()
-    if not token:
-        return
-
-    creds = _get_dingtalk_creds()
-    robot_code = creds.get("DINGTALK_APP_KEY", "")
-
-    url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
-    payload = json.dumps({
-        "robotCode": robot_code,
-        "openConversationId": chat_id,
-        "msgKey": "sampleMarkdown",
-        "msgParam": json.dumps({"title": title, "text": text}, ensure_ascii=False),
-    }, ensure_ascii=False).encode()
-
-    req = Request(url, data=payload, headers={
-        "Content-Type": "application/json; charset=utf-8",
-        "x-acs-dingtalk-access-token": token,
-    })
-
-    try:
-        with urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            logger.info("DingTalk message sent: %s", result)
-    except URLError as exc:
-        logger.error("Failed to send DingTalk: %s", exc)

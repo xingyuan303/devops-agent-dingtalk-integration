@@ -60,23 +60,49 @@ npm install -g aws-cdk  # if not installed
 ```json
 {
   "context": {
-    "agent_space_id": "your-agent-space-id"
+    "agent_space_id": "your-agent-space-id",
+    "dingtalk_chat_id": "your-open-conversation-id",
+    "resource_prefix": "devops-agent"
   }
 }
 ```
 
-### 3. 部署（一键完成 Lambda + ECS Fargate Bot）
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `agent_space_id` | ✅ | AWS DevOps Agent Space ID |
+| `dingtalk_chat_id` | ✅ | 钉钉群的 openConversationId（支持逗号分隔多群） |
+| `resource_prefix` | ❌ | 资源名前缀，默认 `devops-agent`，多套部署时改为不同值避免冲突 |
+| `vpc_id` | ❌ | 现有 VPC ID。留空则新建一个带 NAT Gateway 的 VPC（Bot 走 NAT 出网，无公网 IP） |
+| `destroy_secrets` | ❌ | 默认 `false`（保护凭证）。设为 `true` 时 `cdk destroy` 会删除 Secrets Manager 里的凭证 |
 
+> **关于 Bot 实例数：** Stream 协议是 at-least-once 投递，多个实例会重复消费同一消息，因此 Bot **始终单实例运行**（`desired_count=1`）。健康检查失败会触发 Fargate 自动重启。
+
+### 3. 部署
+
+**本地有 Docker：**
 ```bash
 cdk bootstrap  # first time only
 cdk deploy
 ```
+
+**本地没有 Docker（使用 CodeBuild 远程构建）：**
+
+在 `cdk.json` 中添加 feature flag：
+```json
+{
+  "context": {
+    "@aws-cdk/aws-ecr-assets:buildWithCodeBuild": true
+  }
+}
+```
+然后正常 `cdk deploy`，镜像会在 AWS CodeBuild 中构建。
 
 CDK 会自动：
 - 创建 SNS Topic + 2 个 Lambda（告警通知 + 调查结果通知）
 - 构建 `dingtalk-bot/` Docker 镜像并推送到 ECR
 - 创建 ECS Fargate 集群 + Service（1 个 Task，自动重启）
 - 从 Secrets Manager 注入钉钉凭证到容器环境变量
+- 创建 DLQ 捕获失败的通知消息
 
 ### 4. 填写 Secrets
 
