@@ -1,3 +1,4 @@
+import os
 from aws_cdk import (
     Stack,
     Duration,
@@ -27,7 +28,6 @@ class DevOpsAgentDingTalkStack(Stack):
         dingtalk_chat_id = self.node.try_get_context("dingtalk_chat_id") or ""
         prefix = self.node.try_get_context("resource_prefix") or "devops-agent"
         existing_vpc_id = self.node.try_get_context("vpc_id") or ""
-        # Whether to allow `cdk destroy` to remove secrets (false by default to protect creds)
         destroy_secrets = bool(self.node.try_get_context("destroy_secrets"))
 
         # ── Validation ─────────────────────────────────────────────────────────
@@ -35,6 +35,16 @@ class DevOpsAgentDingTalkStack(Stack):
             raise ValueError(
                 "Missing required context: agent_space_id. "
                 "Set it in cdk.json or pass via -c agent_space_id=xxx"
+            )
+
+        # investigation_notifier requires the bundled boto3 + devops-agent service model
+        bundled_dir = "lambda/investigation_notifier/.bundled"
+        if not os.path.exists(bundled_dir):
+            raise RuntimeError(
+                f"\n\n❌ {bundled_dir} not found.\n"
+                f"DevOps Agent is a new service whose model is not yet in standard boto3.\n"
+                f"Run: bash prebuild.sh\n"
+                f"Then re-run: cdk deploy\n"
             )
 
         secret_removal = RemovalPolicy.DESTROY if destroy_secrets else RemovalPolicy.RETAIN
@@ -96,12 +106,13 @@ class DevOpsAgentDingTalkStack(Stack):
         )
         topic.add_subscription(subs.LambdaSubscription(dingtalk_notifier))
 
-        # ── Lambda: investigation-notifier ─────────────────────────────────────
+        # ── Lambda: investigation-notifier (uses pre-built .bundled dir) ───────
+        # Bundled dir contains: boto3==1.43.9 + custom devops-agent service model
         investigation_notifier = _lambda.Function(self, "InvestigationNotifier",
             function_name=f"{prefix}-investigation-notifier",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="investigation_notifier.handler",
-            code=_lambda.Code.from_asset("lambda/investigation_notifier"),
+            code=_lambda.Code.from_asset(bundled_dir),
             timeout=Duration.seconds(90),
             role=lambda_role,
             dead_letter_queue=dlq,
@@ -114,11 +125,20 @@ class DevOpsAgentDingTalkStack(Stack):
         )
 
         # ── EventBridge Rule (with DLQ) ────────────────────────────────────────
+        # detail_type doesn't support prefix in EventPattern; list all types explicitly
         rule = events.Rule(self, "DevOpsAgentEvents",
             rule_name=f"{prefix}-to-dingtalk",
             event_pattern=events.EventPattern(
                 source=["aws.aidevops"],
-                detail_type=[{"prefix": "Investigation"}, {"prefix": "Mitigation"}],
+                detail_type=[
+                    "Investigation Created", "Investigation Priority Updated",
+                    "Investigation In Progress", "Investigation Completed",
+                    "Investigation Failed", "Investigation Timed Out",
+                    "Investigation Cancelled", "Investigation Pending Triage",
+                    "Investigation Linked", "Investigation Skipped",
+                    "Mitigation In Progress", "Mitigation Completed",
+                    "Mitigation Failed", "Mitigation Timed Out", "Mitigation Cancelled",
+                ],
             ),
         )
         rule.add_target(targets.LambdaFunction(investigation_notifier,
@@ -130,20 +150,24 @@ class DevOpsAgentDingTalkStack(Stack):
         # ── ECS Fargate: DingTalk Bot (Stream bidirectional chat) ──────────────
         # ══════════════════════════════════════════════════════════════════════════
 
-        # VPC: use existing if provided, otherwise create new VPC with NAT Gateway
-        # (avoids exposing public IP on the bot task)
         if existing_vpc_id:
             vpc = ec2.Vpc.from_lookup(self, "Vpc", vpc_id=existing_vpc_id)
         else:
-            vpc = ec2.Vpc(self, "Vpc",
-                max_azs=2,
-                nat_gateways=1,
-            )
+            vpc = ec2.Vpc(self, "Vpc", max_azs=2, nat_gateways=1)
 
         cluster = ecs.Cluster(self, "BotCluster",
             cluster_name=f"{prefix}-bot-cluster",
             vpc=vpc,
         )
+
+        # Explicit execution role so we can grant secret access reliably
+        # (relying on task_def.execution_role auto-creation can fail in some CDK paths)
+        execution_role = iam.Role(self, "BotExecutionRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            managed_policies=[iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AmazonECSTaskExecutionRolePolicy")],
+        )
+        dingtalk_secret.grant_read(execution_role)
 
         # Task Role
         task_role = iam.Role(self, "BotTaskRole",
@@ -159,9 +183,8 @@ class DevOpsAgentDingTalkStack(Stack):
             memory_limit_mib=512,
             cpu=256,
             task_role=task_role,
+            execution_role=execution_role,
         )
-        # Grant secrets to execution role (needed for ECS secret injection)
-        dingtalk_secret.grant_read(task_def.execution_role)
 
         task_def.add_container("dingtalk-bot",
             image=ecs.ContainerImage.from_asset("dingtalk-bot"),
@@ -177,7 +200,6 @@ class DevOpsAgentDingTalkStack(Stack):
                 "DEVOPS_AGENT_SPACE_ID": agent_space_id,
                 "AWS_REGION": self.region,
             },
-            # Health check: verify main process is running (procps installed in Dockerfile)
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "pgrep -f 'python app.py' || exit 1"],
                 interval=Duration.seconds(30),
@@ -188,13 +210,13 @@ class DevOpsAgentDingTalkStack(Stack):
         )
 
         # Fargate Service — single instance only
-        # (DingTalk Stream protocol delivers each message at-least-once to ALL subscribers,
-        #  running multiple replicas would cause duplicate processing)
+        # (DingTalk Stream protocol delivers each message at-least-once;
+        #  multiple replicas would cause duplicate processing)
         ecs.FargateService(self, "BotService",
             cluster=cluster,
             task_definition=task_def,
             desired_count=1,
-            assign_public_ip=False,  # bot uses NAT Gateway for outbound
+            assign_public_ip=False,
             service_name=f"{prefix}-bot",
             circuit_breaker=ecs.DeploymentCircuitBreaker(rollback=True),
         )
@@ -204,5 +226,9 @@ class DevOpsAgentDingTalkStack(Stack):
             description="Point your CloudWatch Alarms AlarmActions here")
         CfnOutput(self, "DLQUrl", value=dlq.queue_url,
             description="Dead letter queue for failed notifications")
+        CfnOutput(self, "DingTalkSecretName", value=dingtalk_secret.secret_name,
+            description="Fill with: aws secretsmanager put-secret-value --secret-id <this>")
+        CfnOutput(self, "WebhookSecretName", value=webhook_sm.secret_name,
+            description="Fill with: aws secretsmanager put-secret-value --secret-id <this>")
         CfnOutput(self, "DingTalkNotifierName", value=dingtalk_notifier.function_name)
         CfnOutput(self, "InvestigationNotifierName", value=investigation_notifier.function_name)

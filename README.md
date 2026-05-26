@@ -251,7 +251,23 @@ npm install -g aws-cdk  # 如未安装
 | `vpc_id` | ❌ | 现有 VPC ID。**留空则新建 VPC + NAT Gateway**（Bot 走 NAT 出网，无公网 IP；约 $32-65/月） |
 | `destroy_secrets` | ❌ | 默认 `false`（保护凭证）。设为 `true` 时 `cdk destroy` 会删除 Secrets Manager 中的凭证 |
 
-### 3. 部署
+### 3. 预构建 Lambda 依赖 ⚠️ 必需
+
+DevOps Agent 是新服务，标准 boto3 还不识别它。需要预先把自定义 service model 和指定版本的 boto3 打包：
+
+```bash
+bash prebuild.sh
+```
+
+这会在 `lambda/investigation_notifier/.bundled/` 中创建：
+- `boto3==1.43.9` + `botocore==1.43.9`（已知支持 devops-agent service stub 的版本）
+- `botocore/data/devops-agent/2026-01-01/`（DevOps Agent service model）
+- `investigation_notifier.py` + `dingtalk_utils.py`
+
+> **何时重跑：** 修改了 `investigation_notifier.py` 或 `dingtalk_utils.py` 后重新执行 `bash prebuild.sh`。
+> **Bot 镜像无需手动 prebuild**：Dockerfile 中已 `pip install boto3==1.43.9` 并 `COPY botocore-ext/devops-agent` 注入。
+
+### 4. 部署
 
 **方式 A：本地 Docker 构建**
 ```bash
@@ -265,7 +281,7 @@ cdk deploy
 ```json
 "@aws-cdk/aws-ecr-assets:buildWithCodeBuild": true
 ```
-然后正常 `cdk deploy`，镜像会在 AWS CodeBuild 中构建并推送到 ECR。
+然后正常 `cdk deploy`，Bot 镜像会在 AWS CodeBuild 中构建并推送到 ECR。
 
 CDK 会自动创建：
 - SNS Topic + 2 个 Lambda + DLQ
@@ -274,7 +290,7 @@ CDK 会自动创建：
 - VPC（如未指定 `vpc_id`）+ NAT Gateway
 - Secrets Manager 凭证仓库
 
-### 4. 填写 Secrets
+### 5. 填写 Secrets
 
 ```bash
 # 钉钉应用凭证（同时供 Bot 和 Lambda 使用）
@@ -296,7 +312,7 @@ aws secretsmanager put-secret-value \
 
 > Webhook URL 和 Secret 从 AWS Console → DevOps Agent → Agent Space → Webhook 配置中获取。
 
-### 5. 接入 CloudWatch Alarm
+### 6. 接入 CloudWatch Alarm
 
 将 SNS Topic ARN 设为 Alarm 的 AlarmActions（CDK 输出的 `SNSTopicArn`）：
 
@@ -308,7 +324,7 @@ aws cloudwatch put-metric-alarm \
   ...
 ```
 
-### 6. 验证
+### 7. 验证
 
 ```bash
 # 测试告警通知链路

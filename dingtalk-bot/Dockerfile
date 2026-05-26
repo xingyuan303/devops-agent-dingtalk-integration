@@ -8,6 +8,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Inject DevOps Agent service model (DevOps Agent is a new service not yet in standard boto3)
+COPY botocore-ext/devops-agent /usr/local/lib/python3.12/site-packages/botocore/data/devops-agent
+
 COPY app.py .
 
 RUN useradd -u 1000 -m botuser
