@@ -1,5 +1,4 @@
 """Lambda: Forward CloudWatch Alarm alerts to DingTalk and trigger DevOps Agent investigation."""
-import base64
 import hashlib
 import hmac
 import json
@@ -7,7 +6,6 @@ import logging
 import os
 import time
 import uuid
-from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -18,10 +16,13 @@ logger.setLevel(logging.INFO)
 
 DINGTALK_SECRET_NAME = os.environ.get("DINGTALK_SECRET_NAME", "")
 WEBHOOK_SECRET_NAME = os.environ.get("WEBHOOK_SECRET_NAME", "")
+DINGTALK_CHAT_ID = os.environ.get("DINGTALK_CHAT_ID", "")
 
 _secrets_client = None
 _dingtalk_creds = None
 _webhook_creds = None
+_access_token = ""
+_token_expires = 0
 
 
 def _secrets():
@@ -47,17 +48,30 @@ def _get_webhook_creds():
     return _webhook_creds or {}
 
 
-def _sign_dingtalk(secret: str) -> tuple:
-    """Generate DingTalk webhook signature (timestamp + sign)."""
-    timestamp = str(round(time.time() * 1000))
-    string_to_sign = f"{timestamp}\n{secret}"
-    hmac_code = hmac.new(
-        secret.encode("utf-8"),
-        string_to_sign.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).digest()
-    sign = quote_plus(base64.b64encode(hmac_code))
-    return timestamp, sign
+def _get_access_token():
+    global _access_token, _token_expires
+    if _access_token and time.time() < _token_expires:
+        return _access_token
+    creds = _get_dingtalk_creds()
+    if not creds:
+        return ""
+    payload = json.dumps({
+        "appKey": creds["DINGTALK_APP_KEY"],
+        "appSecret": creds["DINGTALK_APP_SECRET"],
+    }).encode()
+    req = Request(
+        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+        data=payload, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            _access_token = result.get("accessToken", "")
+            _token_expires = time.time() + result.get("expireIn", 7200) - 300
+            return _access_token
+    except URLError as e:
+        logger.error("Failed to get access_token: %s", e)
+        return ""
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -88,7 +102,6 @@ def _handle_cloudwatch_alarm(body):
     status = "🔴 ALARM" if new_state == "ALARM" else "🟢 OK"
     summary = f"{namespace}/{metric}: {reason[:200]}" if metric else reason[:300]
 
-    # Build CloudWatch console URL
     alarm_arn = body.get("AlarmArn", "")
     arn_parts = alarm_arn.split(":")
     alarm_region = arn_parts[3] if len(arn_parts) > 3 else "us-east-1"
@@ -97,7 +110,6 @@ def _handle_cloudwatch_alarm(body):
         f"?region={alarm_region}#alarmsV2:alarm/{alarm_name}"
     )
 
-    # Send DingTalk notification
     markdown = (
         f"### {status} {alarm_name}\n\n"
         f"- **时间**: {timestamp}\n"
@@ -107,7 +119,6 @@ def _handle_cloudwatch_alarm(body):
     )
     _send_dingtalk_markdown(f"[ALARM] {alarm_name}", markdown)
 
-    # Trigger investigation for ALARM state
     if new_state == "ALARM":
         _trigger_investigation(alarm_name, summary)
 
@@ -116,7 +127,6 @@ def _handle_cloudwatch_alarm(body):
 
 # ── Trigger DevOps Agent Investigation ─────────────────────────────────────────
 def _trigger_investigation(title, description):
-    """Call Agent Space Webhook directly to trigger investigation."""
     creds = _get_webhook_creds()
     webhook_url = creds.get("WEBHOOK_URL", "")
     webhook_secret = creds.get("WEBHOOK_SECRET", "")
@@ -139,9 +149,7 @@ def _trigger_investigation(title, description):
     })
 
     signature = hmac.new(
-        webhook_secret.encode(),
-        payload.encode(),
-        hashlib.sha256,
+        webhook_secret.encode(), payload.encode(), hashlib.sha256,
     ).hexdigest()
 
     req = Request(webhook_url, data=payload.encode(), headers={
@@ -156,40 +164,37 @@ def _trigger_investigation(title, description):
         logger.error("Failed to trigger investigation: %s", exc)
 
 
-# ── DingTalk Sending ───────────────────────────────────────────────────────────
+# ── DingTalk OpenAPI Sending ───────────────────────────────────────────────────
 def _send_dingtalk_markdown(title: str, text: str):
-    """Send markdown message to DingTalk group via custom robot webhook."""
-    creds = _get_dingtalk_creds()
-    webhook_url = creds.get("DINGTALK_WEBHOOK_URL", "")
-    secret = creds.get("DINGTALK_SECRET", "")
-
-    if not webhook_url:
-        logger.warning("DingTalk webhook URL not configured")
+    """Send markdown via DingTalk OpenAPI (robot groupMessages)."""
+    chat_id = DINGTALK_CHAT_ID
+    if not chat_id:
+        logger.warning("DINGTALK_CHAT_ID not configured")
         return
 
-    # Append signature if secret is configured
-    if secret:
-        timestamp, sign = _sign_dingtalk(secret)
-        webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
+    token = _get_access_token()
+    if not token:
+        return
 
+    creds = _get_dingtalk_creds()
+    robot_code = creds.get("DINGTALK_APP_KEY", "")
+
+    url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
     payload = json.dumps({
-        "msgtype": "markdown",
-        "markdown": {
-            "title": title,
-            "text": text,
-        },
-    }).encode()
+        "robotCode": robot_code,
+        "openConversationId": chat_id,
+        "msgKey": "sampleMarkdown",
+        "msgParam": json.dumps({"title": title, "text": text}, ensure_ascii=False),
+    }, ensure_ascii=False).encode()
 
-    req = Request(webhook_url, data=payload, headers={
-        "Content-Type": "application/json",
+    req = Request(url, data=payload, headers={
+        "Content-Type": "application/json; charset=utf-8",
+        "x-acs-dingtalk-access-token": token,
     })
 
     try:
         with urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode())
-            if result.get("errcode") != 0:
-                logger.error("DingTalk send failed: %s", result)
-            else:
-                logger.info("DingTalk message sent successfully")
+            logger.info("DingTalk message sent: %s", result)
     except URLError as exc:
         logger.error("Failed to send DingTalk: %s", exc)

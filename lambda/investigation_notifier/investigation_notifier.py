@@ -1,12 +1,8 @@
 """Lambda: Forward DevOps Agent investigation results to DingTalk."""
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
 import time
-from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -16,11 +12,14 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DINGTALK_SECRET_NAME = os.environ.get("DINGTALK_SECRET_NAME", "")
+DINGTALK_CHAT_ID = os.environ.get("DINGTALK_CHAT_ID", "")
 DEVOPS_AGENT_SPACE_ID = os.environ.get("DEVOPS_AGENT_SPACE_ID", "")
 
 _secrets_client = None
 _dingtalk_creds = None
 _devops_client = None
+_access_token = ""
+_token_expires = 0
 _processed_events = set()
 
 
@@ -34,9 +33,7 @@ def _secrets():
 def _devops():
     global _devops_client
     if _devops_client is None:
-        _devops_client = boto3.client(
-            "devops-agent", region_name=os.environ.get("AWS_REGION", "us-east-1")
-        )
+        _devops_client = boto3.client("devops-agent", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     return _devops_client
 
 
@@ -48,25 +45,36 @@ def _get_dingtalk_creds():
     return _dingtalk_creds or {}
 
 
-def _sign_dingtalk(secret: str) -> tuple:
-    """Generate DingTalk webhook signature."""
-    timestamp = str(round(time.time() * 1000))
-    string_to_sign = f"{timestamp}\n{secret}"
-    hmac_code = hmac.new(
-        secret.encode("utf-8"),
-        string_to_sign.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).digest()
-    sign = quote_plus(base64.b64encode(hmac_code))
-    return timestamp, sign
+def _get_access_token():
+    global _access_token, _token_expires
+    if _access_token and time.time() < _token_expires:
+        return _access_token
+    creds = _get_dingtalk_creds()
+    if not creds:
+        return ""
+    payload = json.dumps({
+        "appKey": creds["DINGTALK_APP_KEY"],
+        "appSecret": creds["DINGTALK_APP_SECRET"],
+    }).encode()
+    req = Request(
+        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+        data=payload, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            _access_token = result.get("accessToken", "")
+            _token_expires = time.time() + result.get("expireIn", 7200) - 300
+            return _access_token
+    except URLError as e:
+        logger.error("Failed to get access_token: %s", e)
+        return ""
 
 
 # ── Summary fetching ───────────────────────────────────────────────────────────
 def _get_summary(execution_id, record_type="investigation_summary_md"):
-    """Fetch summary journal record with retry."""
     if not execution_id:
         return None
-
     for attempt in range(3):
         try:
             response = _devops().list_journal_records(
@@ -88,15 +96,12 @@ def _get_summary(execution_id, record_type="investigation_summary_md"):
 
 
 def _format_summary(summary_text):
-    """Extract root cause section from Agent's markdown output."""
     if not summary_text:
         return ""
-
     lines = summary_text.strip().split("\n")
     sections = []
     current_heading = None
     current_lines = []
-
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("## ") or stripped.startswith("# "):
@@ -106,70 +111,56 @@ def _format_summary(summary_text):
             current_lines = []
         elif current_heading and stripped:
             current_lines.append(stripped)
-
     if current_heading:
         sections.append((current_heading, current_lines))
-
     if not sections:
         non_empty = [l.strip() for l in lines if l.strip()]
         return "\n".join(non_empty[:4])
-
-    # Find root cause section
     root_keywords = ["根本原因", "根因", "root cause", "conclusion", "结论"]
     for heading, content in sections:
         if any(kw in heading.lower() for kw in root_keywords):
             return f"**{heading}**\n\n" + "\n".join(content)
-
-    # Fallback: first section with substantial content
     for heading, content in sections:
         if len(content) >= 2:
             return f"**{heading}**\n\n" + "\n".join(content)
-
     heading, content = sections[0]
     return f"**{heading}**\n\n" + "\n".join(content)
 
 
 # ── DingTalk sending ───────────────────────────────────────────────────────────
 def _send_dingtalk_markdown(title: str, text: str):
-    """Send markdown message to DingTalk group via custom robot webhook."""
-    creds = _get_dingtalk_creds()
-    webhook_url = creds.get("DINGTALK_WEBHOOK_URL", "")
-    secret = creds.get("DINGTALK_SECRET", "")
-
-    if not webhook_url:
-        logger.warning("DingTalk webhook URL not configured")
+    chat_id = DINGTALK_CHAT_ID
+    if not chat_id:
+        logger.warning("DINGTALK_CHAT_ID not configured")
         return
+    token = _get_access_token()
+    if not token:
+        return
+    creds = _get_dingtalk_creds()
+    robot_code = creds.get("DINGTALK_APP_KEY", "")
 
-    if secret:
-        timestamp, sign = _sign_dingtalk(secret)
-        webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
-
+    url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
     payload = json.dumps({
-        "msgtype": "markdown",
-        "markdown": {
-            "title": title,
-            "text": text,
-        },
-    }).encode()
+        "robotCode": robot_code,
+        "openConversationId": chat_id,
+        "msgKey": "sampleMarkdown",
+        "msgParam": json.dumps({"title": title, "text": text}, ensure_ascii=False),
+    }, ensure_ascii=False).encode()
 
-    req = Request(webhook_url, data=payload, headers={
-        "Content-Type": "application/json",
+    req = Request(url, data=payload, headers={
+        "Content-Type": "application/json; charset=utf-8",
+        "x-acs-dingtalk-access-token": token,
     })
-
     try:
         with urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode())
-            if result.get("errcode") != 0:
-                logger.error("DingTalk send failed: %s", result)
-            else:
-                logger.info("DingTalk message sent successfully")
+            logger.info("DingTalk sent: %s", result)
     except URLError as exc:
         logger.error("Failed to send DingTalk: %s", exc)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 def handler(event, context):
-    # Dedup
     event_id = event.get("id", "")
     if event_id in _processed_events:
         return {"statusCode": 200, "body": "duplicate"}
@@ -191,22 +182,18 @@ def handler(event, context):
     execution_id = metadata.get("execution_id", "")
     priority = data.get("priority", "UNKNOWN")
 
-    # Skip noisy states
     if detail_type in ("Investigation In Progress", "Investigation Linked"):
         return {"statusCode": 200, "body": "skipped"}
 
-    # Mitigation completed → send result
     if detail_type == "Mitigation Completed":
         summary = _get_summary(execution_id, "mitigation_summary_md")
         if summary:
-            text = f"### 🛠 DevOps Agent 修复建议\n\n{_format_summary(summary)}"
-            _send_dingtalk_markdown("修复建议", text)
+            _send_dingtalk_markdown("修复建议", f"### 🛠 DevOps Agent 修复建议\n\n{_format_summary(summary)}")
         return {"statusCode": 200, "body": "mitigation handled"}
 
     if detail_type.startswith("Mitigation"):
         return {"statusCode": 200, "body": f"mitigation: {detail_type}"}
 
-    # Investigation events → send to DingTalk
     icon = {
         "Investigation Created": "🔍",
         "Investigation Completed": "✅",
@@ -224,7 +211,7 @@ def handler(event, context):
         summary = _get_summary(execution_id) or ""
         if summary:
             text += f"\n{_format_summary(summary)}\n"
-        text += f"\n> 💡 如需修复建议，请在 Agent Space 中请求缓解计划（调查 ID: {task_id}）"
+        text += f"\n> 💡 如需修复建议，在群里 @Bot 发送：请为调查 {task_id} 生成缓解计划"
 
     _send_dingtalk_markdown(f"{icon} 调查更新", text)
     return {"statusCode": 200, "body": "ok"}

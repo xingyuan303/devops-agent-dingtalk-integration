@@ -2,7 +2,6 @@
   "app": "python3 app.py",
   "context": {
     "agent_space_id": "",
-    "dingtalk_webhook_url": "",
-    "dingtalk_secret": ""
+    "dingtalk_chat_id": ""
   }
 }
