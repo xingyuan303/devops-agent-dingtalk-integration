@@ -70,14 +70,14 @@ def _format_summary(summary_text):
     if not sections:
         non_empty = [l.strip() for l in lines if l.strip()]
         return "\n".join(non_empty[:4])
+    # Find root cause section by keywords
     root_keywords = ["根本原因", "根因", "root cause", "conclusion", "结论"]
     for heading, content in sections:
         if any(kw in heading.lower() for kw in root_keywords):
             return f"**{heading}**\n\n" + "\n".join(content)
-    for heading, content in sections:
-        if len(content) >= 2:
-            return f"**{heading}**\n\n" + "\n".join(content)
-    heading, content = sections[0]
+
+    # Fallback: take the last section (typically the conclusion)
+    heading, content = sections[-1]
     return f"**{heading}**\n\n" + "\n".join(content)
 
 
