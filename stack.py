@@ -12,7 +12,6 @@ from aws_cdk import (
     aws_ecs as ecs,
     aws_ec2 as ec2,
     aws_logs as logs,
-    aws_ecr_assets as ecr_assets,
 )
 from constructs import Construct
 
@@ -131,7 +130,7 @@ class DevOpsAgentDingTalkStack(Stack):
             task_role=task_role,
         )
 
-        # Container — image built via CodeBuild (no local Docker needed)
+        # Container image — built locally or via CodeBuild (controlled by use_codebuild context)
         container = task_def.add_container("dingtalk-bot",
             image=ecs.ContainerImage.from_asset("dingtalk-bot"),
             logging=ecs.LogDrivers.aws_logs(

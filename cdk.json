@@ -3,6 +3,6 @@
   "context": {
     "agent_space_id": "",
     "dingtalk_chat_id": "",
-    "@aws-cdk/aws-ecr-assets:buildWithCodeBuild": true
+    "use_codebuild": false
   }
 }
