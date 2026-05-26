@@ -114,6 +114,76 @@ aws cloudwatch set-alarm-state \
 cdk destroy
 ```
 
+## 钉钉机器人配置指南
+
+### 方式一：自定义 Webhook 机器人（本项目使用）
+
+用于单向告警通知，无需公网回调端点。
+
+1. 打开目标钉钉群 → 群设置 → 智能群助手 → 添加机器人
+2. 选择「自定义」机器人
+3. 安全设置选择「加签」，记录生成的 **Secret**（以 `SEC` 开头）
+4. 完成后记录 **Webhook URL**（`https://oapi.dingtalk.com/robot/send?access_token=xxx`）
+5. 将 Webhook URL 和 Secret 填入 Secrets Manager（见上方步骤 4）
+
+### 方式二：钉钉应用 + Stream 模式（双向对话，可选扩展）
+
+如需在群里 @Bot 与 DevOps Agent 进行双向 SRE 对话，需创建钉钉企业内部应用：
+
+#### 1. 创建钉钉应用
+
+1. 前往 [钉钉开放平台](https://open-dev.dingtalk.com) → 创建企业内部应用
+2. 添加「机器人」能力
+3. 在「机器人与消息推送」中启用 **Stream 模式**（长连接接收消息）
+4. 记录 **App Key** 和 **App Secret**
+5. 需要申请权限：`qyapi_robot_sendmsg`（用于主动发送消息）
+6. 发布应用上线，将机器人添加到目标群聊
+
+> 钉钉 Stream 模式与企微 aibot 长连接类似：Bot 主动连接钉钉 WebSocket，无需公网回调 URL。
+
+#### 2. Stream 协议流程
+
+```
+Bot POST /v1.0/gateway/connections/open → 获取 WebSocket endpoint + ticket
+  → 连接 WebSocket
+  → 接收 SYSTEM/CALLBACK/PING 事件
+  → 通过 OpenAPI 发送回复消息
+```
+
+Gateway 订阅配置：`{"type": "CALLBACK", "topic": "/v1.0/im/bot/messages/get"}`（注意类型是 CALLBACK 而非 EVENT）。
+
+#### 3. 架构图
+
+```
+User (钉钉群聊)
+      │  @dingtalk-bot <question>
+      ▼
+DingTalk Stream  wss://... (gateway/connections/open)
+      │  CALLBACK event (bot message)
+      ▼
+dingtalk-bot Pod/Lambda  (IRSA or IAM Role)
+      │  boto3.devops-agent.create_chat / send_message
+      ▼
+AWS DevOps Agent Space
+      │  EventStream response
+      ▼
+dingtalk-bot  (解析 EventStream → 拆分 3500B)
+      │  OpenAPI /v1.0/robot/groupMessages/send  markdown
+      ▼
+DingTalk ──▶ User
+```
+
+#### 4. 故障排查
+
+| 症状 | 原因 | 修复方法 |
+|------|------|----------|
+| Gateway 返回 `incomplete response` | App Key/Secret 错误或应用未发布 | 检查凭证；确认钉钉应用已发布上线 |
+| WebSocket 连接后立即断开 | Stream 模式未启用 | 在钉钉开放平台「机器人与消息推送」中确认已启用 Stream 模式 |
+| 群消息发送失败 `status=403` | access_token 过期或权限不足 | 检查 token 刷新是否正常；确认已申请 `qyapi_robot_sendmsg` 权限 |
+| WS 断开后迟迟不重连 | DNS 故障或出站阻断 | 确认网络出口到 `api.dingtalk.com:443` 未被策略拦截 |
+
+> 双向对话的完整实现参考 [JoeShi/devops-agent-demo](https://github.com/JoeShi/devops-agent-demo) 中的 `k8s/dingtalk-bot/` 目录。
+
 ## 注意事项
 
 * 钉钉自定义机器人需要配置「加签」安全设置，Secret 以 `SEC` 开头
