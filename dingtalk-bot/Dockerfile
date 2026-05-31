@@ -1,5 +1,8 @@
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
+# Force unbuffered stdout/stderr so logs reach CloudWatch in real time
+ENV PYTHONUNBUFFERED=1
+
 # procps provides pgrep, used by the ECS health check
 RUN apt-get update \
     && apt-get install -y --no-install-recommends procps \

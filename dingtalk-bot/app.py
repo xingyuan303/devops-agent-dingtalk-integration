@@ -8,7 +8,9 @@ import collections
 import json
 import logging
 import os
+import re
 import signal
+import sys
 import threading
 import time
 import urllib.error
@@ -18,7 +20,12 @@ import boto3
 from websockets.sync.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger("dingtalk-bot")
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -29,25 +36,21 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 REPLY_MAX_BYTES = 3500
 MAX_BACKOFF_SECONDS = 60
-MAX_SESSIONS = 200
 GATEWAY_URL = "https://api.dingtalk.com/v1.0/gateway/connections/open"
 
 HELP_TEXT = """### 🤖 DevOps Agent Bot 使用说明
 
 - 在群里 **@我** 并输入问题，我会调用 AWS DevOps Agent 进行分析
-- 支持多轮对话（同一群聊共享上下文）
+- 每次提问会创建新的对话上下文（Agent 调查任务完成后旧上下文不再响应）
 - 输入 `/help` 查看本帮助
-- 输入 `/reset` 重置当前对话上下文
 
 **示例问题：**
 - 为什么 CPU 使用率飙升？
 - 最近有哪些告警？
 - 请分析 RDS 连接数异常"""
 
-# ── Globals ───────────────────────────────────────────────────────────────────
+# ── AWS DevOps Agent client ───────────────────────────────────────────────────
 devops = boto3.client("devops-agent", region_name=AWS_REGION)
-_sessions: collections.OrderedDict[str, str] = collections.OrderedDict()
-_lock = threading.Lock()
 _shutdown = threading.Event()
 
 # ── DingTalk access token ─────────────────────────────────────────────────────
@@ -77,48 +80,91 @@ def _get_access_token() -> str:
             return ""
 
 
-# ── Session management (LRU) ──────────────────────────────────────────────────
-def get_or_create_execution(session_key: str) -> str:
-    with _lock:
-        if session_key in _sessions:
-            _sessions.move_to_end(session_key)
-            return _sessions[session_key]
-        # Evict oldest if at capacity
-        while len(_sessions) >= MAX_SESSIONS:
-            evicted = _sessions.popitem(last=False)
-            logger.info("Evicted session: %s", evicted[0])
-        resp = devops.create_chat(agentSpaceId=AGENT_SPACE_ID)
-        _sessions[session_key] = resp["executionId"]
-        logger.info("Created execution %s for session %s", resp["executionId"], session_key)
-        return _sessions[session_key]
+# ── Agent invocation ──────────────────────────────────────────────────────────
+def ask_devops_agent(query: str) -> str:
+    """Create a fresh execution per message and collect the streamed response.
 
-
-def reset_session(session_key: str):
-    with _lock:
-        _sessions.pop(session_key, None)
-
-
-def ask_devops_agent(session_key: str, query: str) -> str:
-    execution_id = get_or_create_execution(session_key)
+    Old executions stop responding after the previous task completes, so we
+    always create a new chat. This trades context continuity for reliability.
+    """
     try:
-        resp = devops.send_message(agentSpaceId=AGENT_SPACE_ID, executionId=execution_id, content=query)
+        # Always create a fresh execution (old ones stop responding after completion)
+        chat = devops.create_chat(agentSpaceId=AGENT_SPACE_ID)
+        execution_id = chat["executionId"]
+        logger.info("Created execution %s", execution_id)
+
+        resp = devops.send_message(
+            agentSpaceId=AGENT_SPACE_ID,
+            executionId=execution_id,
+            content=query,
+        )
+        # Track block types via contentBlockStart events; only keep type='text' blocks
+        block_types: dict[int, str] = {}
         blocks: dict[int, list[str]] = {}
         for event in resp.get("events", []):
-            if "contentBlockDelta" in event:
+            if "contentBlockStart" in event:
+                start = event["contentBlockStart"]
+                block_types[start.get("index", 0)] = start.get("type", "")
+            elif "contentBlockDelta" in event:
                 block = event["contentBlockDelta"]
                 idx = block.get("contentBlockIndex", 0)
                 text_delta = block.get("delta", {}).get("textDelta", {})
                 if "text" in text_delta:
                     blocks.setdefault(idx, []).append(text_delta["text"])
             elif "responseFailed" in event:
-                return f"DevOps Agent 返回错误：{event['responseFailed'].get('errorMessage', 'unknown')}"
+                err = event["responseFailed"]
+                logger.error("Agent response failed: %s", err.get("errorMessage"))
+                return f"DevOps Agent 返回错误：{err.get('errorMessage', 'unknown')}"
+
         if not blocks:
             return "（DevOps Agent 未返回内容）"
-        return "".join(blocks[max(blocks.keys())])
+
+        # Filter to text-type blocks only (skip tool-use, etc.)
+        text_blocks = {idx: blocks[idx] for idx in blocks
+                       if block_types.get(idx, "text") == "text"}
+        if not text_blocks:
+            text_blocks = blocks
+
+        # Take the last text block (Agent's final response)
+        last_idx = max(text_blocks.keys())
+        text = "".join(text_blocks[last_idx]).strip()
+
+        # Dedup: Agent sometimes repeats output within a single block
+        if text:
+            text = _dedup_response(text)
+
+        return text or "（DevOps Agent 未返回内容）"
     except Exception:
         logger.exception("DevOps Agent call failed")
-        reset_session(session_key)
-        return "调用 DevOps Agent 失败，已重置会话，请重试。"
+        return "调用 DevOps Agent 失败，请重试。"
+
+
+def _dedup_response(text: str) -> str:
+    """Remove duplicated content within a single response block.
+
+    Agent sometimes outputs the same ## section or paragraph multiple times.
+    Strategy:
+      - If response contains ## headers: keep last unique ## section only
+      - Otherwise: split by paragraphs (\\n\\n) and remove duplicates
+    """
+    if "\n## " in text:
+        parts = re.split(r'(?=^## )', text, flags=re.MULTILINE)
+        sections = [p.strip() for p in parts if p.strip().startswith("## ")]
+        if sections:
+            seen = []
+            for s in sections:
+                if s not in seen:
+                    seen.append(s)
+            return seen[-1]
+        return text
+
+    # No headers — paragraph-level dedup
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    seen = []
+    for p in paragraphs:
+        if p not in seen:
+            seen.append(p)
+    return "\n\n".join(seen)
 
 
 # ── UTF-8 chunker ─────────────────────────────────────────────────────────────
@@ -215,29 +261,25 @@ def handle_callback(data: dict):
     conversation_id = data.get("conversationId", "")
     conversation_type = data.get("conversationType", "1")
     sender_id = data.get("senderId", data.get("senderStaffId", ""))
-    session_key = conversation_id if conversation_type == "2" else (sender_id or "default")
 
     text_obj = data.get("text", {})
     text = (text_obj.get("content", "") if isinstance(text_obj, dict) else str(text_obj)).strip()
     if not text:
         return
 
-    logger.info("Received [%s]: %s", session_key, text[:200])
+    log_key = conversation_id or sender_id or "default"
+    logger.info("Received [%s]: %s", log_key, text[:200])
 
-    # Built-in commands
+    # Built-in command
     if text.lower() in ("/help", "帮助"):
         send_reply(conversation_id, sender_id, conversation_type, HELP_TEXT)
-        return
-    if text.lower() in ("/reset", "重置"):
-        reset_session(session_key)
-        send_reply(conversation_id, sender_id, conversation_type, "✅ 对话上下文已重置")
         return
 
     def _process():
         # Instant ACK
         send_reply(conversation_id, sender_id, conversation_type, "收到，正在思考…")
-        reply = ask_devops_agent(session_key, text)
-        logger.info("Reply [%s]: %s", session_key, reply[:200])
+        reply = ask_devops_agent(text)
+        logger.info("Reply [%s]: %s", log_key, reply[:200])
         send_reply(conversation_id, sender_id, conversation_type, reply)
 
     threading.Thread(target=_process, daemon=True).start()

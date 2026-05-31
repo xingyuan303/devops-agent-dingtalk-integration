@@ -49,6 +49,21 @@ def _get_summary(execution_id, record_type="investigation_summary_md"):
     return None
 
 
+def _get_task_title(task_id):
+    """Fetch the backlog task title (alarm name) via GetBacklogTask API."""
+    if not task_id:
+        return ""
+    try:
+        resp = _devops().get_backlog_task(
+            agentSpaceId=DEVOPS_AGENT_SPACE_ID,
+            taskId=task_id,
+        )
+        return resp.get("task", {}).get("title", "")
+    except Exception as exc:
+        logger.error("GetBacklogTask failed for %s: %s", task_id, exc)
+        return ""
+
+
 def _format_summary(summary_text):
     if not summary_text:
         return ""
@@ -76,9 +91,13 @@ def _format_summary(summary_text):
         if any(kw in heading.lower() for kw in root_keywords):
             return f"**{heading}**\n\n" + "\n".join(content)
 
-    # Fallback: take the last section (typically the conclusion)
-    heading, content = sections[-1]
-    return f"**{heading}**\n\n" + "\n".join(content)
+    # Fallback: show all sections (truncated to keep card concise)
+    result = []
+    for heading, content in sections:
+        body = "\n".join(content[:3])
+        result.append(f"**{heading}**\n{body}")
+    full = "\n\n".join(result)
+    return full[:2000] if len(full) > 2000 else full
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -135,7 +154,10 @@ def handler(event, context):
         summary = _get_summary(execution_id) or ""
         if summary:
             text += f"\n{_format_summary(summary)}\n"
-        text += f"\n> 💡 如需修复建议，在群里 @Bot 发送：请为调查 {task_id} 生成缓解计划"
+        # Use alarm name if available, fall back to task_id
+        task_title = _get_task_title(task_id)
+        prompt_target = f"告警「{task_title}」" if task_title else f"调查 {task_id}"
+        text += f"\n> 💡 如需修复建议，在群里 @Bot 发送：\n> `请用中文为{prompt_target}生成详细的修复计划`"
 
     send_dingtalk_markdown(DINGTALK_SECRET_NAME, DINGTALK_CHAT_ID, f"{icon} 调查更新", text)
     return {"statusCode": 200, "body": "ok"}
