@@ -1,0 +1,54 @@
+{
+  "name": "cloudwatch-alarm-auto-rca-dingtalk",
+  "version": "1.0.0",
+  "description": "CloudWatch Alarm Auto RCA - Automated root cause analysis with DingTalk notifications",
+  "main": "dist/bin/app.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest --runInBand",
+    "test:unit": "jest --testPathPattern=test/unit",
+    "test:property": "jest --testPathPattern=test/property",
+    "test:integration": "jest --testPathPattern=test/integration",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "aws",
+    "cdk",
+    "cloudwatch",
+    "rca",
+    "devops",
+    "dingtalk",
+    "钉钉"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1046.0",
+    "@aws-sdk/client-devops-agent": "^3.1052.0",
+    "@aws-sdk/client-dynamodb": "^3.1046.0",
+    "@aws-sdk/client-lambda": "^3.1052.0",
+    "@aws-sdk/client-secrets-manager": "^3.1053.0",
+    "@aws-sdk/client-sfn": "^3.1053.0",
+    "@aws-sdk/client-ssm": "^3.1046.0",
+    "@aws-sdk/lib-dynamodb": "^3.1046.0",
+    "aws-cdk-lib": "^2.254.0",
+    "constructs": "^10.6.0",
+    "source-map-support": "^0.5.21"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.7.0",
+    "@types/source-map-support": "^0.5.10",
+    "aws-cdk": "^2.1121.0",
+    "esbuild": "^0.28.0",
+    "fast-check": "^4.8.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
